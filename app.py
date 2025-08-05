@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 import unicodedata
 import hjson
 from flask import Flask, request, jsonify, redirect
+import base64 # Import base64 module
 
 app = Flask(__name__)
 
@@ -267,7 +268,7 @@ def catalog(type, id, config_b64):
         tmdb_type = "movie"
         tmdb_list_type = "popular"
     elif id == "prehrajto_series_popular":
-        tmdb_type = "tv"
+        tmdb_type = "tv" # Use 'tv' for series in TMDB API
         tmdb_list_type = "popular"
     else:
         # Fallback if catalog ID is unexpected
@@ -292,11 +293,6 @@ def catalog(type, id, config_b64):
             })
     elif tmdb_type:
         # Fetch from TMDB, then attempt to find on Prehraj.to
-        # This part requires more complex matching (title + year)
-        # For simplicity, we'll just fetch popular from TMDB for now and point to search
-        # A full TMDB integration with Prehraj.to linking would be more involved
-        
-        # Example for popular movies from TMDB
         page = (skip // 20) + 1 # Stremio skip is offset, TMDB pages start at 1
         tmdb_url = f'https://api.themoviedb.org/3/{tmdb_type}/{tmdb_list_type}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS&page={page}'
         try:
@@ -315,11 +311,13 @@ def catalog(type, id, config_b64):
                 background_path = item.get('backdrop_path')
                 background = f"https://image.tmdb.org/t/p/w1280{background_path}" if background_path else "https://prehraj.to/favicon.ico"
 
-                meta_id = f"tmdb:{tmdb_type}:{item.get('id')}"
+                # Use the actual TMDB type (movie/tv) for the meta_id for consistency
+                actual_tmdb_type = 'movie' if tmdb_type == 'movie' else 'series' # Convert 'tv' to 'series' for Stremio
+                meta_id = f"tmdb:{actual_tmdb_type}:{item.get('id')}"
 
                 metas.append({
                     "id": meta_id,
-                    "type": type,
+                    "type": type, # This 'type' comes from Stremio request (movie/series)
                     "name": title,
                     "poster": poster,
                     "background": background,
@@ -330,8 +328,8 @@ def catalog(type, id, config_b64):
                     "released": item.get('release_date') or item.get('first_air_date'),
                     "imdbRating": str(item.get('vote_average'))[:3],
                     "trailer": None,
-                    "videos": [],
-                    "search_query": f"{title} {year}"
+                    "videos": [], # Videos for series are handled in /meta endpoint
+                    "search_query": f"{title} {year}" # Store search query for later stream resolution
                 })
         except Exception as e:
             print(f"Error fetching TMDB catalog for {id}: {e}")
@@ -343,17 +341,11 @@ def catalog(type, id, config_b64):
 
 @app.route('/meta/<type>/<id>.json')
 def meta(type, id):
-    # This route is used to provide detailed metadata for a specific item ID.
-    # Stremio might request this if user clicks on an item in a catalog or search result.
-    # The 'id' here is the one we provided in the catalog, e.g., "pt:https://prehraj.to/..." or "tmdb:movie:123"
-
     item_id_parts = id.split(':')
     
     if item_id_parts[0] == "pt": # If it's a Prehraj.to specific item from our search results
-        prehrajto_url = id.replace("pt:", "") # Extract the Prehraj.to URL
+        prehrajto_url = id.replace("pt:", "")
         
-        # You could fetch more detailed info from the Prehraj.to page here if needed
-        # For now, we'll just return basic info, as the main goal is to provide streams
         return jsonify({
             "meta": {
                 "id": id,
@@ -367,14 +359,26 @@ def meta(type, id):
             }
         })
     elif item_id_parts[0] == "tmdb": # If it's a TMDB item
-        tmdb_type = item_id_parts[1]
-        tmdb_id = item_id_parts[2]
+        # Handle different ID formats for TMDB that Stremio might send:
+        # 1. tmdb:TMDB_ID (e.g., from search results where type is implicit from route)
+        # 2. tmdb:TYPE:TMDB_ID (e.g., from catalog where type is explicit)
+        if len(item_id_parts) == 2: # e.g., tmdb:1061474 (assuming type is in URL path)
+            tmdb_id = item_id_parts[1]
+            tmdb_type_for_api = type # Use the 'type' from the URL path (movie/series)
+        elif len(item_id_parts) == 3: # e.g., tmdb:movie:1061474 (ideal format from catalog)
+            tmdb_type_for_api = item_id_parts[1]
+            tmdb_id = item_id_parts[2]
+        else:
+            print(f"Unexpected TMDB ID format for meta: {id}")
+            return jsonify({"meta": None})
 
-        if tmdb_type == 'movie':
+        # Map Stremio 'series' type to TMDB 'tv' type
+        if tmdb_type_for_api == 'movie':
             tmdb_url = f'https://api.themoviedb.org/3/movie/{tmdb_id}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS'
-        elif tmdb_type == 'tv':
+        elif tmdb_type_for_api == 'series' or tmdb_type_for_api == 'tv': # Accept both
             tmdb_url = f'https://api.themoviedb.org/3/tv/{tmdb_id}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS'
         else:
+            print(f"Unsupported TMDB type for meta: {tmdb_type_for_api}")
             return jsonify({"meta": None})
 
         try:
@@ -383,7 +387,7 @@ def meta(type, id):
             title = tmdb_res.get('title') or tmdb_res.get('name')
             year = tmdb_res.get('release_date', '').split('-')[0] or tmdb_res.get('first_air_date', '').split('-')[0]
             plot = tmdb_res.get('overview', '')
-            genre_ids = tmdb_res.get('genres', []) # For meta, genres are objects, not just IDs
+            genre_ids = tmdb_res.get('genres', [])
             genres = [g.get('name') for g in genre_ids if g.get('name')]
             
             poster_path = tmdb_res.get('poster_path')
@@ -392,36 +396,42 @@ def meta(type, id):
             background_path = tmdb_res.get('backdrop_path')
             background = f"https://image.tmdb.org/t/p/w1280{background_path}" if background_path else "https://prehraj.to/favicon.ico"
 
-            # For series, we need to list seasons and episodes
             videos = []
-            if type == 'series':
+            if type == 'series': # Only populate 'videos' array for series type
                 seasons = tmdb_res.get('seasons', [])
                 for season in seasons:
                     season_number = season.get('season_number')
-                    if season_number is None or season.get('name') == 'Speciály':
+                    # Skip season 0 (Specials) or seasons without a number
+                    if season_number is None or season_number == 0 or season.get('name') == 'Speciály':
                         continue
                     
-                    # Fetch episodes for this season
                     episodes_url = f'https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season_number}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS'
-                    episodes_res = json.loads(urlopen(episodes_url).read())
-                    for episode in episodes_res.get('episodes', []):
-                        episode_number = episode.get('episode_number')
-                        if episode_number is None:
-                            continue
+                    try:
+                        episodes_res = json.loads(urlopen(episodes_url).read())
+                        for episode in episodes_res.get('episodes', []):
+                            episode_number = episode.get('episode_number')
+                            if episode_number is None:
+                                continue
 
-                        episode_name = episode.get('name', f"Epizóda {episode_number}")
-                        formatted_search_query = f"{title} S{str(season_number).zfill(2)}E{str(episode_number).zfill(2)}"
-
-                        videos.append({
-                            "id": f"pt:{formatted_search_query}", # Use this ID for stream resolution
-                            "title": f"S{str(season_number).zfill(2)}E{str(episode_number).zfill(2)} - {episode_name}",
-                            "season": season_number,
-                            "episode": episode_number,
-                            "released": episode.get('air_date'),
-                            "overview": episode.get('overview'),
-                            "thumbnail": f"http://image.tmdb.org/t/p/w185{episode.get('still_path')}" if episode.get('still_path') else poster,
-                            "prehrajto_search_query": formatted_search_query # Store search query for stream
-                        })
+                            episode_name = episode.get('name', f"Epizóda {episode_number}")
+                            
+                            # Construct a robust search query for Prehraj.to for this specific episode
+                            # Use encode to remove diacritics for better search results on Prehraj.to
+                            series_title_encoded = encode(title) # Encode the series title
+                            formatted_search_query = f"{series_title_encoded} S{str(season_number).zfill(2)}E{str(episode_number).zfill(2)}"
+                            
+                            videos.append({
+                                "id": f"tmdb:series:{tmdb_id}:{formatted_search_query}", # This ID will be passed to /stream
+                                "title": f"S{str(season_number).zfill(2)}E{str(episode_number).zfill(2)} - {episode_name}",
+                                "season": season_number,
+                                "episode": episode_number,
+                                "released": episode.get('air_date'),
+                                "overview": episode.get('overview'),
+                                "thumbnail": f"http://image.tmdb.org/t/p/w185{episode.get('still_path')}" if episode.get('still_path') else poster,
+                                # "prehrajto_search_query": formatted_search_query # Not directly needed as it's part of 'id' now
+                            })
+                    except Exception as epi_e:
+                        print(f"Error fetching episodes for season {season_number} of {tmdb_id}: {epi_e}")
             
             return jsonify({
                 "meta": {
@@ -435,7 +445,7 @@ def meta(type, id):
                     "year": year,
                     "imdbRating": str(tmdb_res.get('vote_average'))[:3],
                     "released": tmdb_res.get('release_date') or tmdb_res.get('first_air_date'),
-                    "videos": videos if type == 'series' else [] # Add videos array only for series
+                    "videos": videos # Add videos array only for series, otherwise it's empty
                 }
             })
         except Exception as e:
@@ -447,55 +457,60 @@ def meta(type, id):
 
 @app.route('/stream/<type>/<id>.json')
 def stream(type, id):
-    # This is the most crucial part: resolving the actual stream URL.
-    # The 'id' here will be either "pt:https://prehraj.to/..." for direct links,
-    # or "tmdb:movie:123" / "tmdb:tv:123" for TMDB items which require a search on Prehraj.to
-    
     item_id_parts = id.split(':')
     prehrajto_url = None
     search_query = None
 
-    if item_id_parts[0] == "pt":
-        # Direct Prehraj.to URL provided (from catalog search results)
-        prehrajto_url = id.replace("pt:", "")
-    elif item_id_parts[0] == "tmdb":
-        # Need to get meta first to retrieve the search query
-        # This is a simplification; in a real scenario, you'd fetch TMDB meta first
-        # to get the title and year/season/episode to construct the search query.
-        # For now, we'll assume the 'id' might contain enough info or we'd get it from a 'meta' request beforehand
-        
-        # Let's assume for TMDB items, 'id' is 'tmdb:type:tmdb_id'
-        # We need to search Prehraj.to using the TMDB title + year (for movies)
-        # or title + SXXEXX (for episodes)
-        
-        if type == 'movie':
-            # For movies, search by TMDB ID, get title and year, then search Prehraj.to
-            tmdb_id = item_id_parts[2]
-            tmdb_url = f'https://api.themoviedb.org/3/movie/{tmdb_id}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS'
-            try:
-                tmdb_res = json.loads(urlopen(tmdb_url).read())
-                title = tmdb_res.get('title')
-                year = tmdb_res.get('release_date', '').split('-')[0]
-                if title and year:
-                    search_query = f"{title} {year}"
-            except Exception as e:
-                print(f"Error fetching TMDB movie for stream: {e}")
-                return jsonify({"streams": []})
-        elif type == 'series' and len(item_id_parts) == 4: # Format: tmdb:series:tmdb_id:SXXEXX_query
-             # For series, the ID provided to stream often contains the exact search query
-             # e.g., id="pt:Movie Title S01E01"
-             search_query = item_id_parts[3] # This assumes the last part of ID is the search query
-        elif type == 'series':
-            # If the ID for series stream is just tmdb:tv:tmdb_id, we need a separate request to get seasons/episodes
-            # and let user choose. Stremio usually expects direct episode ID for series streams.
-            # This logic needs refinement based on how Stremio sends episode requests.
-            # For now, if it's a general series ID, we return no streams.
-            print(f"Received general series ID for stream: {id}. Stremio expects specific episode ID.")
-            return jsonify({"streams": []})
+    premium_status, session_obj = get_premium_session()
 
+    if item_id_parts[0] == "pt":
+        # Direct Prehraj.to URL provided (from catalog search results or episode ID)
+        prehrajto_url = id.replace("pt:", "")
+        # If it's a search query from pt:SEARCH_QUERY (e.g., for series episodes)
+        # We need to distinguish if 'pt' id is a direct URL or a search query
+        # This requires checking if it's a URL or not.
+        if not (prehrajto_url.startswith("http://") or prehrajto_url.startswith("https://")):
+            search_query = prehrajto_url # It's actually a search query
+            prehrajto_url = None # Clear prehrajto_url if it's a search query
+            print(f"Detected 'pt:' ID as search query: {search_query}")
+
+    elif item_id_parts[0] == "tmdb":
+        if type == 'movie':
+            # For movies, the ID in stream endpoint is typically tmdb:movie:TMDB_ID
+            # Or tmdb:TMDB_ID if Stremio sent it like that (e.g. from general search)
+            tmdb_id_for_api = None
+            if len(item_id_parts) == 3 and item_id_parts[1] == 'movie': # tmdb:movie:TMDB_ID
+                tmdb_id_for_api = item_id_parts[2]
+            elif len(item_id_parts) == 2: # tmdb:TMDB_ID (common for search results clicked directly for stream)
+                tmdb_id_for_api = item_id_parts[1]
+            else:
+                print(f"Unexpected TMDB movie ID format for stream: {id}")
+                return jsonify({"streams": []})
+
+            if tmdb_id_for_api:
+                tmdb_url = f'https://api.themoviedb.org/3/movie/{tmdb_id_for_api}?api_key=1f0150a5f78d4adc2407911989fdb66c&language=cs-CS'
+                try:
+                    tmdb_res = json.loads(urlopen(tmdb_url).read())
+                    title = tmdb_res.get('title')
+                    year = tmdb_res.get('release_date', '').split('-')[0]
+                    if title and year:
+                        search_query = encode(f"{title} {year}") # Encode for Prehraj.to search
+                except Exception as e:
+                    print(f"Error fetching TMDB movie for stream: {e}")
+                    return jsonify({"streams": []})
+        elif type == 'series':
+            # For series episodes, the ID format we generated is tmdb:series:TMDB_SERIES_ID:SEARCH_QUERY_FOR_PREHRAJTO
+            if len(item_id_parts) == 4 and item_id_parts[1] == 'series':
+                search_query = item_id_parts[3] # This is the specific search query we pre-calculated
+                print(f"Detected TMDB series ID as search query: {search_query}")
+            else:
+                print(f"Unexpected TMDB series ID format for stream: {id}. Expected 'tmdb:series:TMDB_ID:SEARCH_QUERY'.")
+                return jsonify({"streams": []})
+    else:
+        print(f"Unsupported ID format for stream: {id}")
+        return jsonify({"streams": []})
 
     streams = []
-    premium_status, session_obj = get_premium_session()
 
     if prehrajto_url:
         # Use the provided Prehraj.to URL directly
@@ -580,7 +595,6 @@ def stream(type, id):
 
 def base64_decode(data):
     """Decode base64 string (Stremio sends config in base64)."""
-    import base64
     missing_padding = len(data) % 4
     if missing_padding != 0:
         data += '='* (4 - missing_padding)
