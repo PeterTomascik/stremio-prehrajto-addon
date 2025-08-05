@@ -305,12 +305,6 @@ def catalog(type, id, config_b64):
                 title = item.get('title') or item.get('name')
                 year = item.get('release_date', '').split('-')[0] or item.get('first_air_date', '').split('-')[0]
                 
-                # We need to *search* Prehraj.to for this item, not just list it
-                # For a true link, you'd search Prehraj.to here and if found, use its URL
-                
-                # For now, let's just create a meta item with TMDB info
-                # and note that a stream would require searching Prehraj.to
-                
                 plot = item.get('overview', '')
                 genre_ids = item.get('genre_ids', [])
                 genres = [gid[g] for g in genre_ids if g in gid]
@@ -321,8 +315,6 @@ def catalog(type, id, config_b64):
                 background_path = item.get('backdrop_path')
                 background = f"https://image.tmdb.org/t/p/w1280{background_path}" if background_path else "https://prehraj.to/favicon.ico"
 
-                # Stremio requires an ID specific to the addon, and a unique per item
-                # For items coming from TMDB, we'll use TMDB ID but need to make clear it's a "search_and_play"
                 meta_id = f"tmdb:{tmdb_type}:{item.get('id')}"
 
                 metas.append({
@@ -337,15 +329,15 @@ def catalog(type, id, config_b64):
                     "year": year,
                     "released": item.get('release_date') or item.get('first_air_date'),
                     "imdbRating": str(item.get('vote_average'))[:3],
-                    "trailer": None, # Not provided by Prehraj.to directly
-                    "videos": [], # For series, list seasons/episodes
-                    "search_query": f"{title} {year}" # Store search query for later stream resolution
+                    "trailer": None,
+                    "videos": [],
+                    "search_query": f"{title} {year}"
                 })
-        
-        # If it's a series, we need to add seasons/episodes as sub-catalogs or parts of meta.videos
-        # This is more complex for catalog, usually handled in meta.
-        # For this basic version, we'll keep it simple: Search for entire title on Prehraj.to for streams.
-
+        except Exception as e:
+            print(f"Error fetching TMDB catalog for {id}: {e}")
+            # In case of an error, metas will remain empty or partially filled,
+            # and the function will still return jsonify({"metas": metas})
+            
     return jsonify({"metas": metas})
 
 
